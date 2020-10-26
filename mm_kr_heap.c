@@ -6,6 +6,7 @@
  *
  *  @since Feb 13, 2019
  *  @author philip gust
+ *  @modified rong chang
  */
 
 
@@ -33,12 +34,17 @@ typedef union Header {
 // forward declarations
 static Header *morecore(size_t);
 void visualize(const char*);
+inline static Header *mm_next(Header *bp);
+inline static void mm_unlink(Header *bp);
 
 /*
  * Check whether multiply overflows (true if overflow)
  * Extracted from:
  *   https://github.com/Cloudef/chck/blob/master/chck/overflow/overflow.h
  */
+#ifndef __has_builtin
+#define __has_builtin(x) 0
+#endif
 #if __GNUC__ >= 5 || __has_builtin(__builtin_add_overflow)
 /* assume clang and gcc (>=5) to only have builtins for now. */
 #define mul_of(a, b, r) __builtin_mul_overflow(a, b, r)
@@ -47,30 +53,24 @@ void visualize(const char*);
 #define mul_of(a, b, r) (((*(r) = ((a) * (b))) || *(r) == 0) && ((a) != 0 && (b) > *(r) / (a)))
 #endif
 
-/** Empty list to get started */
-static Header base;
-
+static bool debug = false;
 /** Start of free memory list */
 static Header *freep = NULL;
-
 /**
  * Initialize memory allocator
  */
 void mm_init(void) {
 	mem_init();
-	// init dummy node
-    base.s.ptr = freep = &base;
-    base.s.size = 0;
+    freep = NULL;
 }
 
 /**
  * Reset memory allocator.
  */
 void mm_reset(void) {
-	mem_reset_brk();
-	// reset dummy node
-	base.s.ptr = freep = &base;
-    base.s.size = 0;
+    if (debug) visualize("RESET");
+    mem_reset_brk();
+    freep = NULL;
 }
 
 /**
@@ -78,9 +78,7 @@ void mm_reset(void) {
  */
 void mm_deinit(void) {
 	mem_deinit();
-
-	base.s.ptr = freep = &base;
-    base.s.size = 0;
+    freep = NULL;
 }
 
 /**
@@ -92,7 +90,7 @@ void mm_deinit(void) {
 inline static size_t mm_units(size_t nbytes) {
     /* smallest count of Header-sized memory chunks */
     /*  (+1 additional chunk for the Header itself) needed to hold nbytes */
-    return (nbytes + sizeof(Header) - 1) / sizeof(Header) + 1;
+    return (nbytes + 2 * sizeof(Header) - 1) / sizeof(Header) + 1;
 }
 
 /**
@@ -123,8 +121,138 @@ inline static void *mm_payload(Header *bp) {
 inline static Header *mm_block(void *ap) {
 	return (Header*)ap - 1;
 }
+/**
+ *  get pointer to block footer from header pointer 
+ *
+ * @param hp the header pointer
+ */
+inline static Header *mm_footer(Header *hp) {      
+    return hp + hp->s.size - 1;
+}
+/**
+ * get pointer to block header from footer pointer
+ *
+ * @param ap the footer pointer
+ */
+inline static Header *mm_header(Header *fp) {
+    return fp - fp->s.size + 1;
+}
 
+/**
+ * get size of blocks in header units
+ *
+ * @param bp the block pointer
+ */
+inline static size_t mm_size(Header *bp) {
+    return bp->s.size;
+}
+/**
+ * set size of block in header units 
+ *
+ * @param bp the block pointer
+ */
+inline static void mm_setSize(Header *bp, size_t size) {
+    bp->s.size = size;
+    mm_footer(bp)->s.size = size;
+}
+/**
+ * get next block in free list
+ *
+ * @param bp the block pointer
+ */
+inline static Header *mm_next(Header *bp) {
+    return bp->s.ptr;
+}
+/**
+ * set next block in free list
+ *
+ * @param bp the block pointer
+ * @param next the next block pointer 
+ */
+inline static void mm_setNext(Header *bp, Header *next) {
+    bp->s.ptr = next;
+}
+/**
+ * get prev block in free list
+ *
+ * @param bp the block pointer
+ */
+inline static Header *mm_prev(Header *bp) {
+   return mm_footer(bp)->s.ptr;
+}
+/**
+ * set prev block in free list
+ *
+ * @param bp the block pointer
+ * @param prev the prev block pointer 
+ */
+inline static void mm_setPrev(Header *bp, Header *prev) {
+    mm_footer(bp)->s.ptr = prev;
+}
+/**
+ * get block before in memory (NULL if no block) 
+ *
+ * @param bp the block pointer
+ */
+inline static Header * mm_before(Header *bp) {
+    if ((void *) bp <= mem_heap_lo()) {
+        return NULL;
+    }
+    return mm_header(bp - 1);
+}
+/**
+ * get block after in memory (NULL if no block)
+ *
+ * @param bp the block pointer
+ */
+inline static Header * mm_after(Header *bp) {
+    if ((void *)(bp + bp->s.size) > mem_heap_hi()) {
+        return NULL;
+    }
+    return bp + bp->s.size;
+}
 
+/**
+ * unlink the block from free list
+ *
+ * @param bp the block pointer
+ */
+inline static void mm_unlink(Header *bp) {
+    if (mm_next(bp) == bp) {
+        mm_setNext(bp, NULL);
+        mm_setPrev(bp, NULL);
+        freep = NULL;
+        return;
+    }
+    else {
+        Header * prev = mm_prev(bp);
+        Header * next = mm_next(bp);
+        mm_setNext(prev, next);
+        mm_setPrev(next, prev);
+        mm_setNext(bp, NULL);
+        mm_setPrev(bp, NULL);
+    }
+
+}
+
+/**
+ * link block into free list
+ *
+ * @param bp the block pointer
+ */
+inline static void mm_link(Header *bp, Header *pos) {
+    if (pos == NULL) {
+        mm_setNext(bp, bp);
+        mm_setPrev(bp, bp);
+        freep = bp;
+        return;
+    }
+    Header *prev = mm_prev(pos);
+    mm_setNext(prev, bp);
+    mm_setPrev(bp, prev);
+    mm_setNext(bp, pos);
+    mm_setPrev(pos, bp);
+}
 /**
  * Allocates size bytes of memory and returns a pointer to the
  * allocated memory, or NULL if request storage cannot be allocated.
@@ -133,31 +261,48 @@ inline static Header *mm_block(void *ap) {
  * @return pointer to allocated memory or NULL if not available.
  */
 void *mm_malloc(size_t nbytes) {
+    if (debug) visualize("PRE-MALLOC");
+    Header *p = NULL;
+    size_t nunits = mm_units(nbytes);
+    if (debug) fprintf(stderr, "nunits %zu\n", nunits);
     if (freep == NULL) {
-    	mm_init();
+        p = morecore(nunits);
+        if (p == NULL) {
+            errno = ENOMEM;
+            return NULL;                /* none left */
+        }
+        freep = p;
     }
-
-    Header *prevp = freep;
 
     // smallest count of Header-sized memory chunks
     //  (+1 additional chunk for the Header itself) needed to hold nbytes
-    size_t nunits = mm_units(nbytes);
-
     // traverse the circular list to find a block
-    for (Header *p = prevp->s.ptr; true ; prevp = p, p = p->s.ptr) {
+    for (p = mm_next(freep); true ; p = mm_next(p)) {
         if (p->s.size >= nunits) {          /* found block large enough */
-            if (p->s.size == nunits) {
+            if (debug) fprintf(stderr,"Found block %10p to allocate, size %zu \n", (void*) p, p->s.size);
+            if (p->s.size == nunits || p->s.size == nunits + 1) {
 				// free block exact size
-                prevp->s.ptr = p->s.ptr;
+                if (debug) fprintf(stderr,"Exact fit \n"); 
+                if (freep == p) freep = mm_prev(p);             
+                mm_unlink(p);
             } else {
             	// split and allocate tail end
-                p->s.size -= nunits; // adjust the size to split the block
+                if (debug) fprintf(stderr,"Split \n");
+                Header *prev = mm_prev(p); 
+                Header *next = mm_next(p);
+                mm_setSize(p, mm_size(p) - nunits);
+                mm_setPrev(p, prev);
+                mm_setNext(p, next);
+                if (debug) fprintf(stderr,"First block in split size %zu\n", p->s.size);
                 /* find the address to return */
-                p += p->s.size;		 // address upper block to return
-                p->s.size = nunits;	 // set size of block
+                p += mm_size(p);		 // address upper block to return
+                mm_setSize(p, nunits);
+                mm_setNext(p, NULL);
+                mm_setPrev(p, NULL);
+                if (debug) fprintf(stderr,"Second block in split size %zu\n", p->s.size);
+                freep = prev;
             }
-            p->s.ptr = NULL;  // no longer on free list
-            freep = prevp;  /* move the head */
+            if (debug) visualize("POST-MALLOC");
             return mm_payload(p);
         }
 
@@ -168,6 +313,7 @@ void *mm_malloc(size_t nbytes) {
                 errno = ENOMEM;
                 return NULL;                /* none left */
             }
+            freep = mm_prev(p);
         }
     }
 
@@ -183,49 +329,62 @@ void *mm_malloc(size_t nbytes) {
  * @param ap the memory to free
  */
 void mm_free(void *ap) {
+    if (debug) visualize("PRE-FREE");
 	// ignore null pointer
     if (ap == NULL) {
         return;
     }
 
     Header *bp = mm_block(ap);   /* point to block header */
-
     // validate size field of header block
     assert(bp->s.size > 0 && mm_bytes(bp->s.size) <= mem_heapsize());
-
-    // find where to insert the free space
-    // (bp > p && bp < p->s.ptr) => between two nodes
-    // (p > p->s.ptr)            => this is the end of the list
-    // (p == p->p.ptr)           => list is one element only
-    Header *p = freep;
-    for ( ; !(bp > p && bp < p->s.ptr); p = p->s.ptr) {
-        if (p >= p->s.ptr && (bp > p || bp < p->s.ptr)) {
-        	// freed block at start or end of arena
-            break;
-        }
-	}
-
-    if (bp + bp->s.size == p->s.ptr) {
-		// coalesce if adjacent to upper neighbor
-        bp->s.size += p->s.ptr->s.size;
-        bp->s.ptr = p->s.ptr->s.ptr;
-    } else {
-    	// link in before upper block
-        bp->s.ptr = p->s.ptr;
+    if (freep == NULL) { /* the list is empty. Add the first block to list */
+        if (debug) fprintf(stderr,"Empty free list. Init\n");
+        mm_setNext(bp, bp);
+        mm_setPrev(bp, bp);
+        freep = bp;
+        return;
     }
-
-    if (p + p->s.size == bp) {
-		// coalesce if adjacent to lower block
-        p->s.size += bp->s.size;
-        p->s.ptr = bp->s.ptr;
-
-    } else {
-		// link in after lower block
-        p->s.ptr = bp;
+    Header *pnext = NULL;
+    Header *p = NULL;
+    if (mm_after(bp) != NULL && mm_after(bp)->s.ptr != NULL) {
+		/* coalesce if adjacent to upper neighbor
+         *  unlink the upper block from free list and coalese
+         */
+        if (debug) fprintf(stderr,"Coalese upper \n");
+        pnext = mm_after(bp);
+        /* If the block to unlink happen to be freep, reset freep */
+        if (freep == pnext) freep = mm_prev(pnext); 
+        mm_unlink(pnext); 
+        mm_setSize(bp, mm_size(bp) + mm_size(pnext));
+        mm_setNext(bp, NULL);
+        mm_setPrev(bp, NULL);     
     }
-
+    
+    if (mm_before(bp) != NULL && mm_before(bp)->s.ptr != NULL) {
+        /* coalesce if adjacent to lower block
+         *  unlink the lower block from free list and coalese
+         */
+        if (debug) fprintf(stderr,"Coalese lower \n");
+        p = mm_before(bp);
+        /* If the block to unlink happen to be freep, reset freep */
+        if (freep == p) freep = mm_prev(p);
+        mm_unlink(p);
+        mm_setSize(p, mm_size(p) + mm_size(bp));
+        mm_setNext(bp, NULL);
+        mm_setPrev(bp, NULL);
+        mm_setNext(p, NULL);
+        mm_setPrev(p, NULL);
+        // reset bp to where p is
+        bp = p;     
+    }
+    /* link bp into the free list at freep, 
+     * bp could have been coaesced with upper/lower block already
+     */
+    mm_link(bp, freep);
     /* reset the start of the free list */
-    freep = p;
+    freep = mm_prev(bp);
+    if (debug) visualize("POST-FREE");
 }
 
 /**
@@ -319,8 +478,8 @@ static Header *morecore(size_t nu) {
     }
 
     Header* bp = (Header*)p;
-    bp->s.size = nu;
-
+    // Need to set size for both header and footer
+    mm_setSize(bp, nu);
     // add new space to the circular list
     mm_free(bp+1);
 
@@ -336,30 +495,23 @@ void visualize(const char* msg) {
     fprintf(stderr, "\n--- Free list after \"%s\":\n", msg);
 
     if (freep == NULL) {                   /* does not exist */
-        fprintf(stderr, "    List does not exist\n\n");
+        fprintf(stderr, "    List is empty or not exist\n\n");
         return;
     }
 
     if (freep == freep->s.ptr) {          /* self-pointing list = empty */
-        fprintf(stderr, "    List is empty\n\n");
+        fprintf(stderr, "    List has 1 block\n\n");
+        char* str = "    ";
+        fprintf(stderr, "%sptr: %10p size: %3lu blks - %5lu bytes\n", str, (void *)freep, freep->s.size, mm_bytes(freep->s.size));
         return;
     }
 
-/*
-    tmp = freep;                           // find the start of the list
     char* str = "    ";
-    do {           // traverse the list
-        fprintf(stderr, "%sptr: %10p size: %-3lu blks - %-5lu bytes\n", 
-        	str, (void *)tmp, tmp->s.size, mm_bytes(tmp->s.size));
-        str = " -> ";
-        tmp = tmp->s.ptr;
-    }  while (tmp->s.ptr > freep);
-*/
-    char* str = "    ";
-    for (Header *p = base.s.ptr; p != &base; p = p->s.ptr) {
+    for (Header *p = mm_next(freep); true; p = p->s.ptr) {
         fprintf(stderr, "%sptr: %10p size: %3lu blks - %5lu bytes\n", 
         	str, (void *)p, p->s.size, mm_bytes(p->s.size));
         str = " -> ";
+        if ( p == freep) break;
     }
 
 
